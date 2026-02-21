@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -88,7 +88,7 @@ class SummarizeRequest(BaseModel):
 
 @app.post("/process-pdf")
 @limiter.limit("15/15 minutes")
-def process_pdf(data: PDFPath):
+def process_pdf(request: Request, data: PDFPath):
     global vectorstore, qa_chain
 
     loader = PyPDFLoader(data.filePath)
@@ -107,7 +107,7 @@ def process_pdf(data: PDFPath):
 
 @app.post("/ask")
 @limiter.limit("60/15 minutes")
-def ask_question(data: Question):
+def ask_question(request: Request, data: Question):
     global vectorstore, qa_chain
     if not qa_chain:
         return {"answer": "Please upload a PDF first!"}
@@ -132,7 +132,7 @@ def ask_question(data: Question):
 
 @app.post("/summarize")
 @limiter.limit("15/15 minutes")
-def summarize_pdf(_: SummarizeRequest):
+def summarize_pdf(request: Request, _: SummarizeRequest):
     global vectorstore, qa_chain
     if not qa_chain:
         return {"summary": "Please upload a PDF first!"}
