@@ -27,7 +27,7 @@ Closes #rate-limiting-security
 
 ## Screenshots (if applicable)
 Testing log showing 429 enforcement:
-![Rate Limit Test](file:///d:/GDG/PDF_QA_Bot/tests/rate_limit_verification.png)
+![Rate Limit Test](../public/rate_limit_verification.png)
 
 ## Testing
 - [x] Tested on Desktop (Chrome/Firefox/Safari)
