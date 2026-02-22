@@ -16,8 +16,13 @@ from transformers import (
 )
 import threading
 import logging
+from uuid import uuid4
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 
-# Configure logging
+# --------------------------------------------------
+# Logging
+# --------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -25,25 +30,36 @@ load_dotenv()
 
 app = FastAPI()
 
-# Configuration from environment variables
-LLM_GENERATION_TIMEOUT = int(os.getenv("LLM_GENERATION_TIMEOUT", "30"))  # seconds
-
-# Temporary global variables
-vectorstore = None
-qa_chain = False
+# --------------------------------------------------
+# Config
+# --------------------------------------------------
+LLM_GENERATION_TIMEOUT = int(os.getenv("LLM_GENERATION_TIMEOUT", "30"))
 HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-base")
+
+# --------------------------------------------------
+# Global State (MULTI-DOC)
+# --------------------------------------------------
+VECTOR_STORE = None
+DOCUMENT_REGISTRY = {}
+DOCUMENT_EMBEDDINGS = {}
+
 generation_tokenizer = None
 generation_model = None
 generation_is_encoder_decoder = False
 
-# Load local embedding model
+# --------------------------------------------------
+# Embeddings
+# --------------------------------------------------
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-
+# --------------------------------------------------
+# Model Loading
+# --------------------------------------------------
 def load_generation_model():
     global generation_tokenizer, generation_model, generation_is_encoder_decoder
+
     if generation_model is not None and generation_tokenizer is not None:
         return generation_tokenizer, generation_model, generation_is_encoder_decoder
 
@@ -63,39 +79,34 @@ def load_generation_model():
     return generation_tokenizer, generation_model, generation_is_encoder_decoder
 
 
+# --------------------------------------------------
+# Timeout-safe Generation
+# --------------------------------------------------
 class TimeoutException(Exception):
-    """Raised when generation times out"""
-
     pass
 
 
-def generate_with_timeout(
-    model, encoded, max_new_tokens, pad_token_id, timeout_seconds
-):
-    """Generate with timeout using threading"""
+def generate_with_timeout(model, encoded, max_new_tokens, pad_token_id, timeout):
     result = {"output": None, "error": None}
 
     def target():
         try:
             with torch.no_grad():
-                generated_ids = model.generate(
+                result["output"] = model.generate(
                     **encoded,
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
                     pad_token_id=pad_token_id,
                 )
-            result["output"] = generated_ids
         except Exception as e:
             result["error"] = str(e)
 
-    thread = threading.Thread(target=target)
-    thread.daemon = True
+    thread = threading.Thread(target=target, daemon=True)
     thread.start()
-    thread.join(timeout=timeout_seconds)
+    thread.join(timeout)
 
     if thread.is_alive():
-        logger.warning(f"Generation timed out after {timeout_seconds} seconds")
-        raise TimeoutException(f"Generation timed out after {timeout_seconds} seconds")
+        raise TimeoutException("LLM generation timed out")
 
     if result["error"]:
         raise Exception(result["error"])
@@ -105,122 +116,181 @@ def generate_with_timeout(
 
 def generate_response(prompt: str, max_new_tokens: int) -> str:
     tokenizer, model, is_encoder_decoder = load_generation_model()
-    model_device = next(model.parameters()).device
+    device = next(model.parameters()).device
 
     encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-    encoded = {key: value.to(model_device) for key, value in encoded.items()}
-    pad_token_id = (
-        tokenizer.pad_token_id
-        if tokenizer.pad_token_id is not None
-        else tokenizer.eos_token_id
-    )
+    encoded = {k: v.to(device) for k, v in encoded.items()}
+
+    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
     try:
-        generated_ids = generate_with_timeout(
-            model, encoded, max_new_tokens, pad_token_id, LLM_GENERATION_TIMEOUT
+        output_ids = generate_with_timeout(
+            model,
+            encoded,
+            max_new_tokens,
+            pad_token_id,
+            LLM_GENERATION_TIMEOUT,
         )
-    except TimeoutException as e:
-        logger.error(f"Timeout error: {str(e)}")
+    except TimeoutException:
         raise HTTPException(
             status_code=504,
-            detail="Request timed out. The model took too long to generate a response.",
+            detail="Request timed out. Model took too long to respond.",
         )
     except Exception as e:
-        logger.error(f"Generation error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
     if is_encoder_decoder:
-        text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        return text.strip()
+        return tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
 
     input_len = encoded["input_ids"].shape[1]
-    new_tokens = generated_ids[0][input_len:]
-    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-    return text.strip()
+    return tokenizer.decode(
+        output_ids[0][input_len:], skip_special_tokens=True
+    ).strip()
 
 
+# --------------------------------------------------
+# Schemas
+# --------------------------------------------------
 class PDFPath(BaseModel):
     filePath: str
 
 
 class Question(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
+    doc_ids: list[str] | None = None
 
     @validator("question")
     def validate_question(cls, v):
-        if not v or not v.strip():
-            raise ValueError("Question cannot be empty or whitespace-only")
+        if not v.strip():
+            raise ValueError("Question cannot be empty")
         return v.strip()
 
 
 class SummarizeRequest(BaseModel):
-    pdf: str | None = None
+    doc_ids: list[str] | None = None
 
 
+class CompareRequest(BaseModel):
+    doc_ids: list[str]
+
+
+# --------------------------------------------------
+# Process PDF
+# --------------------------------------------------
 @app.post("/process-pdf")
 def process_pdf(data: PDFPath):
-    global vectorstore, qa_chain
+    global VECTOR_STORE, DOCUMENT_REGISTRY, DOCUMENT_EMBEDDINGS
+
+    if not os.path.exists(data.filePath):
+        return {"error": "File not found."}
 
     loader = PyPDFLoader(data.filePath)
     docs = loader.load()
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
     chunks = splitter.split_documents(docs)
+
     if not chunks:
-        return {
-            "error": "No text chunks generated from the PDF. Please check your file."
-        }
-    vectorstore = FAISS.from_documents(chunks, embedding_model)
+        return {"error": "No text chunks generated."}
 
-    qa_chain = True  # Just a flag to indicate PDF is processed
+    doc_id = str(uuid4())
+    filename = os.path.basename(data.filePath)
 
-    return {"message": "PDF processed successfully"}
+    for c in chunks:
+        c.metadata = {"doc_id": doc_id, "filename": filename}
+
+    if VECTOR_STORE is None:
+        VECTOR_STORE = FAISS.from_documents(chunks, embedding_model)
+    else:
+        VECTOR_STORE.add_documents(chunks)
+
+    embeddings = embedding_model.embed_documents([c.page_content for c in chunks])
+    DOCUMENT_EMBEDDINGS[doc_id] = np.mean(embeddings, axis=0)
+    DOCUMENT_REGISTRY[doc_id] = {"filename": filename, "chunks": len(chunks)}
+
+    return {"message": "PDF processed successfully", "doc_id": doc_id}
 
 
+# --------------------------------------------------
+# Documents
+# --------------------------------------------------
+@app.get("/documents")
+def list_documents():
+    return DOCUMENT_REGISTRY
+
+
+@app.get("/similarity-matrix")
+def similarity_matrix():
+    if len(DOCUMENT_EMBEDDINGS) < 2:
+        return {"error": "At least two documents required"}
+
+    ids = list(DOCUMENT_EMBEDDINGS.keys())
+    vectors = np.array([DOCUMENT_EMBEDDINGS[i] for i in ids])
+    sim = cosine_similarity(vectors)
+
+    return {
+        ids[i]: {ids[j]: float(sim[i][j]) for j in range(len(ids))}
+        for i in range(len(ids))
+    }
+
+
+# --------------------------------------------------
+# Ask
+# --------------------------------------------------
 @app.post("/ask")
 def ask_question(data: Question):
-    global vectorstore, qa_chain
-    if not qa_chain:
-        return {"answer": "Please upload a PDF first!"}
+    if VECTOR_STORE is None:
+        return {"answer": "Upload a PDF first."}
 
-    docs = vectorstore.similarity_search(data.question, k=4)
+    docs = VECTOR_STORE.similarity_search(data.question, k=10)
+
+    if data.doc_ids:
+        docs = [d for d in docs if d.metadata.get("doc_id") in data.doc_ids]
+
     if not docs:
         return {"answer": "No relevant context found."}
 
-    context = "\n\n".join([doc.page_content for doc in docs])
+    context = "\n\n".join(d.page_content for d in docs)
+    prompt = f"Context:\n{context}\n\nQuestion: {data.question}\nAnswer:"
 
-    prompt = (
-        "You are a helpful assistant for question answering over PDF documents. "
-        "Use only the provided context. If the context does not contain the answer, say so briefly.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {data.question}\n"
-        "Answer:"
-    )
-
-    answer = generate_response(prompt, max_new_tokens=256)
-    return {"answer": answer}
+    return {"answer": generate_response(prompt, 300)}
 
 
+# --------------------------------------------------
+# Summarize
+# --------------------------------------------------
 @app.post("/summarize")
-def summarize_pdf(_: SummarizeRequest):
-    global vectorstore, qa_chain
-    if not qa_chain:
-        return {"summary": "Please upload a PDF first!"}
+def summarize_pdf(data: SummarizeRequest):
+    if VECTOR_STORE is None:
+        return {"summary": "Upload a PDF first."}
 
-    docs = vectorstore.similarity_search("Give a concise summary of the document.", k=6)
-    if not docs:
-        return {"summary": "No document context available to summarize."}
+    docs = VECTOR_STORE.similarity_search("Summarize the document.", k=12)
 
-    context = "\n\n".join([doc.page_content for doc in docs])
-    prompt = (
-        "Summarize the following document content in 6-8 concise bullet points.\n\n"
-        f"Context:\n{context}\n\n"
-        "Summary:"
-    )
+    if data.doc_ids:
+        docs = [d for d in docs if d.metadata.get("doc_id") in data.doc_ids]
 
-    summary = generate_response(prompt, max_new_tokens=220)
-    return {"summary": summary}
+    context = "\n\n".join(d.page_content for d in docs)
+    prompt = f"Summarize in bullet points:\n{context}"
+
+    return {"summary": generate_response(prompt, 250)}
+
+
+# --------------------------------------------------
+# Compare
+# --------------------------------------------------
+@app.post("/compare")
+def compare_documents(data: CompareRequest):
+    if VECTOR_STORE is None or len(data.doc_ids) < 2:
+        return {"comparison": "Select at least two documents."}
+
+    docs = VECTOR_STORE.similarity_search("Main differences.", k=15)
+    docs = [d for d in docs if d.metadata.get("doc_id") in data.doc_ids]
+
+    context = "\n\n".join(d.page_content for d in docs)
+    prompt = f"Compare these documents:\n{context}"
+
+    return {"comparison": generate_response(prompt, 600)}
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=5000)
