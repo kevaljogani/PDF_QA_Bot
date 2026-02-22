@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, validator
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -14,10 +14,19 @@ from transformers import (
     AutoModelForSeq2SeqLM,
     AutoModelForCausalLM,
 )
+import threading
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
 app = FastAPI()
+
+# Configuration from environment variables
+LLM_GENERATION_TIMEOUT = int(os.getenv("LLM_GENERATION_TIMEOUT", "30"))  # seconds
 
 # Temporary global variables
 vectorstore = None
@@ -54,6 +63,46 @@ def load_generation_model():
     return generation_tokenizer, generation_model, generation_is_encoder_decoder
 
 
+class TimeoutException(Exception):
+    """Raised when generation times out"""
+
+    pass
+
+
+def generate_with_timeout(
+    model, encoded, max_new_tokens, pad_token_id, timeout_seconds
+):
+    """Generate with timeout using threading"""
+    result = {"output": None, "error": None}
+
+    def target():
+        try:
+            with torch.no_grad():
+                generated_ids = model.generate(
+                    **encoded,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=pad_token_id,
+                )
+            result["output"] = generated_ids
+        except Exception as e:
+            result["error"] = str(e)
+
+    thread = threading.Thread(target=target)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout=timeout_seconds)
+
+    if thread.is_alive():
+        logger.warning(f"Generation timed out after {timeout_seconds} seconds")
+        raise TimeoutException(f"Generation timed out after {timeout_seconds} seconds")
+
+    if result["error"]:
+        raise Exception(result["error"])
+
+    return result["output"]
+
+
 def generate_response(prompt: str, max_new_tokens: int) -> str:
     tokenizer, model, is_encoder_decoder = load_generation_model()
     model_device = next(model.parameters()).device
@@ -66,13 +115,19 @@ def generate_response(prompt: str, max_new_tokens: int) -> str:
         else tokenizer.eos_token_id
     )
 
-    with torch.no_grad():
-        generated_ids = model.generate(
-            **encoded,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=pad_token_id,
+    try:
+        generated_ids = generate_with_timeout(
+            model, encoded, max_new_tokens, pad_token_id, LLM_GENERATION_TIMEOUT
         )
+    except TimeoutException as e:
+        logger.error(f"Timeout error: {str(e)}")
+        raise HTTPException(
+            status_code=504,
+            detail="Request timed out. The model took too long to generate a response.",
+        )
+    except Exception as e:
+        logger.error(f"Generation error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
 
     if is_encoder_decoder:
         text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)

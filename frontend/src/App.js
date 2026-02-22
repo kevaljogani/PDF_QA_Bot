@@ -47,17 +47,35 @@ function App() {
     setUploading(true);
     const formData = new FormData();
     formData.append("file", file);
+
+    // Setup timeout with AbortController
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 90000); // 90 second timeout for upload
+
     try {
-      await axios.post(`${API_BASE}/upload`, formData);
+      await axios.post(`${API_BASE}/upload`, formData, {
+        signal: controller.signal
+      });
       const url = URL.createObjectURL(file);
       setPdfs(prev => [...prev, { name: file.name, url, chat: [] }]);
       setSelectedPdf(file.name);
       alert("PDF uploaded!");
     } catch (e) {
-      const message = e.response?.data?.error || "Upload failed.";
+      let message = "Upload failed.";
+
+      if (e.name === 'AbortError' || e.code === 'ECONNABORTED') {
+        message = "Upload timed out. Please try again with a smaller file.";
+      } else if (e.response?.status === 504) {
+        message = "Gateway timeout. The upload took too long. Please try again.";
+      } else {
+        message = e.response?.data?.error || e.response?.data?.details || "Upload failed.";
+      }
+
       alert(message);
+    } finally {
+      clearTimeout(timeoutId);
+      setUploading(false);
     }
-    setUploading(false);
   };
 
   // Chat per PDF
@@ -78,28 +96,67 @@ function App() {
     setAsking(true);
     const trimmedQuestion = question.trim();
     setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "user", text: trimmedQuestion }] } : pdf));
+
+    // Setup timeout with AbortController
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 second client-side timeout
+
     try {
-      const res = await axios.post(`${API_BASE}/ask`, { question: trimmedQuestion });
+      const res = await axios.post(`${API_BASE}/ask`,
+        { question: trimmedQuestion },
+        { signal: controller.signal }
+      );
       setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "bot", text: res.data.answer }] } : pdf));
     } catch (e) {
-      const errorMsg = e.response?.data?.error || "Error getting answer.";
+      let errorMsg = "Error getting answer.";
+
+      if (e.name === 'AbortError' || e.code === 'ECONNABORTED') {
+        errorMsg = "⏱️ Request timed out. The question took too long to process. Please try a simpler question or try again.";
+      } else if (e.response?.status === 504) {
+        errorMsg = "⏱️ Gateway timeout. The server took too long to respond. Please try again.";
+      } else {
+        errorMsg = e.response?.data?.error || e.response?.data?.details || "Error getting answer.";
+      }
+
       setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "bot", text: errorMsg }] } : pdf));
+    } finally {
+      clearTimeout(timeoutId);
+      setQuestion("");
+      setAsking(false);
     }
-    setQuestion("");
-    setAsking(false);
   };
 
   // Summarization
   const summarizePDF = async () => {
     if (!selectedPdf) return;
     setSummarizing(true);
+
+    // Setup timeout with AbortController
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 60000); // 60 second client-side timeout
+
     try {
-      const res = await axios.post(`${API_BASE}/summarize`, { pdf: selectedPdf });
+      const res = await axios.post(`${API_BASE}/summarize`,
+        { pdf: selectedPdf },
+        { signal: controller.signal }
+      );
       setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "bot", text: res.data.summary }] } : pdf));
     } catch (e) {
-      setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "bot", text: "Error summarizing PDF." }] } : pdf));
+      let errorMsg = "Error summarizing PDF.";
+
+      if (e.name === 'AbortError' || e.code === 'ECONNABORTED') {
+        errorMsg = "⏱️ Request timed out. The summarization took too long. Please try again.";
+      } else if (e.response?.status === 504) {
+        errorMsg = "⏱️ Gateway timeout. The server took too long to respond. Please try again.";
+      } else {
+        errorMsg = e.response?.data?.error || e.response?.data?.details || "Error summarizing PDF.";
+      }
+
+      setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "bot", text: errorMsg }] } : pdf));
+    } finally {
+      clearTimeout(timeoutId);
+      setSummarizing(false);
     }
-    setSummarizing(false);
   };
 
   // Export chat
