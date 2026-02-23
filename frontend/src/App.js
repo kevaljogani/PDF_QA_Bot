@@ -18,7 +18,7 @@ const API_BASE = process.env.REACT_APP_API_URL || "";
 
 function App() {
   const [file, setFile] = useState(null);
-  const [pdfs, setPdfs] = useState([]); // {name, url, chat: []}
+  const [pdfs, setPdfs] = useState([]); // {name, url, chat: [], sessionId: string}
   const [selectedPdf, setSelectedPdf] = useState(null);
   const [question, setQuestion] = useState("");
   const [uploading, setUploading] = useState(false);
@@ -35,9 +35,15 @@ function App() {
     const formData = new FormData();
     formData.append("file", file);
     try {
-      await axios.post(`${API_BASE}/upload`, formData);
+      const response = await axios.post(`${API_BASE}/upload`, formData);
       const url = URL.createObjectURL(file);
-      setPdfs(prev => [...prev, { name: file.name, url, chat: [] }]);
+      const newPdf = { 
+        name: file.name, 
+        url, 
+        chat: [], 
+        sessionId: response.data.sessionId 
+      };
+      setPdfs(prev => [...prev, newPdf]);
       setSelectedPdf(file.name);
       alert("PDF uploaded!");
     } catch (e) {
@@ -51,9 +57,15 @@ function App() {
   const askQuestion = async () => {
     if (!question.trim() || !selectedPdf) return;
     setAsking(true);
+    const currentPdf = pdfs.find(pdf => pdf.name === selectedPdf);
+    if (!currentPdf) return;
+    
     setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "user", text: question }] } : pdf));
     try {
-      const res = await axios.post(`${API_BASE}/ask`, { question });
+      const res = await axios.post(`${API_BASE}/ask`, { 
+        question, 
+        sessionId: currentPdf.sessionId 
+      });
       setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "bot", text: res.data.answer }] } : pdf));
     } catch (e) {
       setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "bot", text: "Error getting answer." }] } : pdf));
@@ -66,8 +78,13 @@ function App() {
   const summarizePDF = async () => {
     if (!selectedPdf) return;
     setSummarizing(true);
+    const currentPdf = pdfs.find(pdf => pdf.name === selectedPdf);
+    if (!currentPdf) return;
+    
     try {
-      const res = await axios.post(`${API_BASE}/summarize`, { pdf: selectedPdf });
+      const res = await axios.post(`${API_BASE}/summarize`, { 
+        sessionId: currentPdf.sessionId 
+      });
       setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "bot", text: res.data.summary }] } : pdf));
     } catch (e) {
       setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "bot", text: "Error summarizing PDF." }] } : pdf));
