@@ -5,7 +5,7 @@ const axios = require("axios");
 const axiosRetry = require("axios-retry").default;
 const path = require("path");
 const rateLimit = require("express-rate-limit");
-const crypto = require("crypto");
+
 const { fileTypeFromFile } = require("file-type");
 const fs = require("fs");
 
@@ -32,6 +32,9 @@ const MAX_RETRY_ATTEMPTS = parseInt(
 app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json());
+
+
+
 
 // ------------------------------------------------------------------
 // SESSION (per-user chat history)
@@ -111,6 +114,9 @@ if (!fs.existsSync(UPLOAD_DIR)) {
 // ------------------------------------------------------------------
 // MULTER CONFIG (multi-format document storage)
 // ------------------------------------------------------------------
+
+
+
 const SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".txt", ".md"];
 
 const storage = multer.diskStorage({
@@ -137,6 +143,7 @@ const upload = multer({
     }
   }
 });
+
 
 // ------------------------------------------------------------------
 // ROUTE: UPLOAD PDF
@@ -189,12 +196,7 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
       return res.status(400).json({ error: "Unsupported file type." });
     }
 
-    //Ensure file is not empty
-    const stats = fs.statSync(filePath);
-    if (stats.size === 0) {
-      fs.unlinkSync(filePath); // Delete the empty file
-      return res.status(400).json({ error: "Uploaded PDF is empty." });
-    }
+
 
     //Ensure file stays in uploads directory and is not executable
     if (!filePath.startsWith(UPLOAD_DIR)) {
@@ -202,7 +204,7 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
       return res.status(400).json({ error: "Invalid file path." });
     }
 
-    await axios.post(
+    const response = await axios.post(
       "http://localhost:5000/process-pdf",
       { filePath, session_id: sessionId },
       { timeout: API_REQUEST_TIMEOUT }
@@ -326,4 +328,24 @@ app.post("/compare", compareLimiter, async (req, res) => {
   }
 });
 
-app.listen(4000, () => console.log("Backend running on http://localhost:4000"));
+
+// Error handling middleware for multer and validation errors
+app.use((err, req, res, next) => {
+  if (err.code === "LIMIT_FILE_SIZE") {
+    return res.status(400).json({
+      error: "File too large. Maximum allowed size is 20MB.",
+    });
+  }
+  if (err.message.includes("Unsupported file type")) {
+    return res.status(400).json({
+      error: err.message,
+    });
+  }
+  next(err);
+});
+// ------------------------------------------------------------------
+// START SERVER
+// ------------------------------------------------------------------
+app.listen(4000, () => {
+  console.log("Backend running on http://localhost:4000");
+});
